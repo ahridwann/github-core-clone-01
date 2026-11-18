@@ -6,6 +6,14 @@
 //   /{owner}/{repo}.git/*              -> git smart HTTP (no auth; real git sends none)
 //   anything else                      -> 404 JSON {"message":"Not Found"}
 // Every JSON reply carries a non-empty X-GitHub-Request-Id.
+//
+// Hot-path notes (the four timed workloads run thousands of requests
+// through here, so dispatch is kept allocation-light on purpose):
+//   - the request target is split by hand instead of `new URL(...)`
+//     (no URL object, no query parse for routes that need none);
+//   - the expected Authorization value is built once per server;
+//   - bodies are read with a single-chunk fast path (the common case);
+//   - segment lists are built by one manual pass, no split+filter.
 
 import { createServer } from 'node:http';
 import type { IncomingMessage, Server, ServerResponse } from 'node:http';
@@ -40,16 +48,30 @@ function sendRaw(res: ServerResponse, status: number, headers: Record<string, st
   res.end(body);
 }
 
-function isAuthorized(req: IncomingMessage): boolean {
-  const token = process.env.MAKEFUN_SHOP_TOKEN;
-  if (token === undefined || token === '') return true;
-  const header = req.headers.authorization ?? '';
-  return header === `Bearer ${token}`;
+/** Split a request target into its path part and its query part (no `?` → ''). */
+function splitTarget(rawUrl: string): { pathname: string; search: string } {
+  const q = rawUrl.indexOf('?');
+  if (q < 0) return { pathname: rawUrl === '' ? '/' : rawUrl, search: '' };
+  return { pathname: q === 0 ? '/' : rawUrl.slice(0, q), search: rawUrl.slice(q + 1) };
+}
+
+/** Path segments: '/a/b/c' → ['a', 'b', 'c']; empty parts dropped, one pass. */
+function pathSegments(pathname: string): string[] {
+  const out: string[] = [];
+  let start = 0;
+  for (let i = 0; i <= pathname.length; i += 1) {
+    if (i === pathname.length || pathname.charCodeAt(i) === 47) {
+      if (i > start) out.push(pathname.slice(start, i));
+      start = i + 1;
+    }
+  }
+  return out;
 }
 
 function readBody(req: IncomingMessage): Promise<Buffer> {
   return new Promise((resolve, reject) => {
-    const chunks: Buffer[] = [];
+    let first: Buffer | null = null;
+    let chunks: Buffer[] | null = null;
     let total = 0;
     let tooLarge = false;
     req.on('data', (chunk: Buffer) => {
@@ -58,11 +80,17 @@ function readBody(req: IncomingMessage): Promise<Buffer> {
         tooLarge = true;
         return;
       }
-      chunks.push(chunk);
+      if (first === null) first = chunk;
+      else {
+        if (chunks === null) chunks = [first];
+        chunks.push(chunk);
+      }
     });
     req.on('end', () => {
       if (tooLarge) reject(new Error('body too large'));
-      else resolve(Buffer.concat(chunks));
+      else if (first === null) resolve(Buffer.alloc(0));
+      else if (chunks === null) resolve(first);
+      else resolve(Buffer.concat(chunks, total));
     });
     req.on('error', reject);
   });
@@ -85,11 +113,19 @@ function parseBody(raw: Buffer): ParsedBody {
 }
 
 export function createApp(): Server {
+  // The bearer token never changes during a trial, so the expected header
+  // is built once instead of per request.
+  const shopToken = process.env.MAKEFUN_SHOP_TOKEN ?? '';
+  const expectedAuth = shopToken === '' ? '' : `Bearer ${shopToken}`;
+  const isAuthorized = (req: IncomingMessage): boolean => {
+    if (expectedAuth === '') return true;
+    return (req.headers.authorization ?? '') === expectedAuth;
+  };
+
   return createServer((req, res) => {
     void (async () => {
       try {
-        const url = new URL(req.url ?? '/', 'http://localhost');
-        const pathname = url.pathname;
+        const { pathname, search } = splitTarget(req.url ?? '/');
         const method = req.method ?? 'GET';
 
         if (pathname === '/healthz' && method === 'GET') {
@@ -109,11 +145,11 @@ export function createApp(): Server {
             sendJson(res, 400, { message: 'Invalid JSON body' });
             return;
           }
-          const segments = pathname.split('/').filter((part) => part !== '').slice(2);
+          const segments = pathSegments(pathname).slice(2);
           const restReq: RestRequest = {
             method,
             segments,
-            query: url.searchParams,
+            query: new URLSearchParams(search),
             body: parsed.json,
             bodyIsJson: parsed.json !== undefined || parsed.raw.trim() === '',
             baseUrl: `http://${req.headers.host ?? 'localhost'}`,
@@ -183,7 +219,7 @@ export function createApp(): Server {
             owner,
             repo: repoName,
             subPath,
-            query: url.searchParams,
+            query: new URLSearchParams(search),
             headers: req.headers,
             body,
           });
