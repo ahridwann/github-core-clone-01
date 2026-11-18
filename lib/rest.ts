@@ -159,6 +159,19 @@ export function issueJsonString(repo: Repo, issue: Issue): string {
   return text;
 }
 
+/**
+ * Same bytes as JSON.stringify(issueJson(repo, issue)) — same key order,
+ * same values, every string through JSON.stringify so escaping is
+ * identical — but without building the intermediate object tree. Used on
+ * the issue-create hot path (200 sequential writes per round).
+ */
+export function issueJsonStringFresh(repo: Repo, issue: Issue): string {
+  const labels = issue.labels.map((label) =>
+    `{"id":${label.id},"node_id":${JSON.stringify(`LA_${label.id}`)},"url":"","name":${JSON.stringify(label.name)},"color":${JSON.stringify(label.color)},"description":${JSON.stringify(label.description)},"default":false}`,
+  ).join(',');
+  return `{"id":${issue.id},"node_id":${JSON.stringify(issue.globalId)},"number":${issue.number},"title":${JSON.stringify(issue.title)},"body":${JSON.stringify(issue.body)},"state":${JSON.stringify(issue.state)},"user":{"login":${JSON.stringify(VIEWER_LOGIN)},"id":${VIEWER_USER.id},"avatar_url":"","html_url":"","type":"User","site_admin":false},"labels":[${labels}],"assignee":null,"assignees":[],"milestone":null,"locked":false,"comments":${(repo.comments.get(issue.number) ?? []).length},"created_at":${JSON.stringify(issue.createdAt)},"updated_at":${JSON.stringify(issue.updatedAt)},"closed_at":${issue.closedAt === null ? 'null' : JSON.stringify(issue.closedAt)},"author_association":"OWNER","url":${JSON.stringify(`/api/v3/repos/${repo.owner}/${repo.name}/issues/${issue.number}`)},"repository_url":${JSON.stringify(`/api/v3/repos/${repo.owner}/${repo.name}`)},"html_url":${JSON.stringify(`/${repo.owner}/${repo.name}/issues/${issue.number}`)}}`;
+}
+
 export function pullJson(repo: Repo, pr: PullRequest): Record<string, unknown> {
   return {
     id: pr.id,
@@ -658,7 +671,7 @@ function handleIssues(req: RestRequest, repo: Repo, rest: string[]): RestRespons
       };
       issue.globalId = opaque('Issue', `${repo.databaseId}:${issue.number}`);
       repo.issues.push(issue);
-      return json(201, issueJson(repo, issue));
+      return { status: 201, headers: { 'content-type': 'application/json; charset=utf-8' }, body: issueJsonStringFresh(repo, issue) };
     }
     return err(404, 'Not Found');
   }

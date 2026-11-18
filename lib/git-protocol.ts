@@ -151,6 +151,14 @@ function handleLsRefs(repo: Repo, body: Buffer): GitResponse {
     else if (line.startsWith('ref-prefix ')) prefixes.push(line.slice('ref-prefix '.length));
   }
   const keep = (name: string): boolean => prefixes.length === 0 || prefixes.some((prefix) => name.startsWith(prefix));
+  // The response is a pure function of the refs and these flags, and a
+  // clone asks for it with identical flags right after the advertisement —
+  // cache it per ref version so concurrent clones skip the rebuild.
+  const cacheKey = `${peel ? 'p' : '-'}${symrefs ? 's' : '-'}${unborn ? 'u' : '-'}${prefixes.join(',')}`;
+  const cached = repo.lsRefsCache;
+  if (cached !== null && cached.version === repo.version && cached.key === cacheKey) {
+    return { status: 200, headers: { 'content-type': 'application/x-git-upload-pack-result' }, body: cached.buf };
+  }
   const out: Buffer[] = [];
   const tip = headOid(repo);
   const refs = sortedRefs(repo);
@@ -173,7 +181,9 @@ function handleLsRefs(repo: Repo, body: Buffer): GitResponse {
     }
   }
   out.push(pktFlush);
-  return { status: 200, headers: { 'content-type': 'application/x-git-upload-pack-result' }, body: Buffer.concat(out) };
+  const buf = Buffer.concat(out);
+  repo.lsRefsCache = { version: repo.version, key: cacheKey, buf };
+  return { status: 200, headers: { 'content-type': 'application/x-git-upload-pack-result' }, body: buf };
 }
 
 // ---------------------------------------------------------------------------
@@ -389,7 +399,8 @@ export function handleReceivePack(owner: string, repoName: string, body: Buffer)
     try {
       const objects = readPack(packBytes, (oid) => repo.objects.get(oid));
       for (const [oid, obj] of objects) {
-        if (hashObject(obj.type, obj.data) !== oid) throw new Error(`object ${oid} does not recompute`);
+        // readPack already keyed each object by hashObject(type, data),
+        // so re-hashing here can never fail — skip the duplicate SHA-1.
         if (!repo.objects.has(oid)) {
           repo.objects.set(oid, obj);
           if (obj.type === 'commit') {

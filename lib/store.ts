@@ -11,7 +11,7 @@ export { VIEWER_LOGIN, VIEWER_USER };
 export const ZERO_OID = '0'.repeat(40);
 
 /** The trial's "now": MAKEFUN_TRIAL_NOW (ISO or epoch ms), else a fixed epoch. */
-export function trialNowSec(): number {
+function computeTrialNowSec(): number {
   const raw = process.env.MAKEFUN_TRIAL_NOW;
   if (raw !== undefined && raw !== '') {
     if (/^\d+$/.test(raw)) {
@@ -24,8 +24,18 @@ export function trialNowSec(): number {
   return 1735689600; // 2025-01-01T00:00:00Z
 }
 
+// The trial clock never moves during a process (the env var is fixed at
+// start), so compute it once instead of re-parsing the env + building a
+// Date on every timestamped write.
+const TRIAL_NOW_SEC = computeTrialNowSec();
+const TRIAL_NOW_ISO = new Date(TRIAL_NOW_SEC * 1000).toISOString();
+
+export function trialNowSec(): number {
+  return TRIAL_NOW_SEC;
+}
+
 export function trialNowIso(): string {
-  return new Date(trialNowSec() * 1000).toISOString();
+  return TRIAL_NOW_ISO;
 }
 
 let globalSeq = 0;
@@ -141,6 +151,8 @@ export interface Repo {
   version: number;
   packCache: Map<string, Buffer>;
   advCache: { version: number; v2: Buffer; v0up: Buffer; v0recv: Buffer } | null;
+  /** Cached ls-refs response: pure function of refs + request flags. */
+  lsRefsCache: { version: number; key: string; buf: Buffer } | null;
   issueJsonCache: Map<number, string>;
 }
 
@@ -189,6 +201,7 @@ export class Store {
       version: 0,
       packCache: new Map(),
       advCache: null,
+      lsRefsCache: null,
       issueJsonCache: new Map(),
     };
     this.repos.set(this.key(owner, name), repo);
@@ -220,6 +233,7 @@ export class Store {
     repo.version += 1;
     repo.packCache.clear();
     repo.advCache = null;
+    repo.lsRefsCache = null;
   }
 }
 
